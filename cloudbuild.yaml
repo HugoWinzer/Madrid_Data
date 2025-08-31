@@ -1,4 +1,4 @@
-# cloudbuild.yaml
+# cloudbuild.yaml (commit to the root of HugoWinzer/Madrid_Data)
 steps:
   - name: gcr.io/cloud-builders/docker
     args: ['build','-t','${_IMAGE}','.']
