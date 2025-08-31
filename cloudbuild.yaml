@@ -1,0 +1,27 @@
+# cloudbuild.yaml
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build','-t','${_IMAGE}','.']
+
+  - name: gcr.io/cloud-builders/docker
+    args: ['push','${_IMAGE}']
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      [
+        'run','deploy','rfp-data-enricher-madrid',
+        '--image','${_IMAGE}',
+        '--region','us-central1',
+        '--allow-unauthenticated',
+        '--service-account','cr-madrid-runtime@rfp-database-464609.iam.gserviceaccount.com',
+        '--set-env-vars','BQ_LOCATION=europe-southwest1,BQ_TABLE=rfp-database-464609.rfpdata.performing_arts_madrid',
+        '--cpu','1','--memory','512Mi','--timeout','600',
+        '--min-instances','0','--max-instances','2'
+      ]
+
+images:
+  - us-central1-docker.pkg.dev/rfp-database-464609/cloud-run-source-deploy/rfp-data-enricher-madrid:$SHORT_SHA
+
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/rfp-database-464609/cloud-run-source-deploy/rfp-data-enricher-madrid:$SHORT_SHA
