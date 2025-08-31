@@ -1,1 +1,9 @@
+# Minimal, safe: do NOT exclude src/
+.git
+.gitignore
+**/__pycache__
+*.pyc
+.DS_Store
+node_modules
+*.log
 
