@@ -6,7 +6,7 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args: ['push','${_IMAGE}']
 
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
       [
