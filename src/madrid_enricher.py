@@ -15,7 +15,6 @@ LOGGER = logging.getLogger("madrid_enricher")
 
 BQ_LOCATION = os.getenv("BQ_LOCATION", DEFAULT_BQ_LOCATION)
 BQ_TABLE = os.getenv("BQ_TABLE", DEFAULT_BQ_TABLE)
-
 bq_client = bigquery.Client()
 
 @app.get("/ping")
@@ -25,15 +24,13 @@ def ping():
 @app.get("/ready")
 def ready():
     try:
-        job = bq_client.query("SELECT 1", job_config=bigquery.QueryJobConfig(location=BQ_LOCATION))
-        list(job.result())
-        # also verify table exists
+        # simple query + table existence check
+        _ = list(bq_client.query("SELECT 1", job_config=bigquery.QueryJobConfig(location=BQ_LOCATION)).result())
         bq_client.get_table(BQ_TABLE)
         return jsonify({"status": "ok", "bq_location": BQ_LOCATION, "table": BQ_TABLE})
     except Exception as e:
         LOGGER.exception("/ready failed")
         return jsonify({"status": "error", "reason": str(e)}), 500
-
 
 def _select_rows(limit: int):
     query = f"""
@@ -49,13 +46,12 @@ def _select_rows(limit: int):
     )
     return list(bq_client.query(query, job_config=job_config).result())
 
-
 def _derive_updates(row: bigquery.table.Row) -> dict:
     domain = (row.get("domain") or "").lower()
     category = row.get("category")
     sub_category = row.get("sub_category")
 
-    # Simple categorization rules
+    # Simple categorization
     if not category:
         if "wizink" in domain:
             category = "Arena"; sub_category = sub_category or "Indoor Arena"
@@ -93,9 +89,7 @@ def _derive_updates(row: bigquery.table.Row) -> dict:
         "notes_append": notes_append,
     }
 
-
 def _update_row(name: str, domain: str, updates: dict) -> int:
-    """Returns affected row count."""
     update_sql = f"""
     UPDATE `{BQ_TABLE}` SET
       capacity_final = COALESCE(@capacity_final, capacity_final),
@@ -122,28 +116,22 @@ def _update_row(name: str, domain: str, updates: dict) -> int:
     _ = job.result()
     return getattr(job, "num_dml_affected_rows", 0) or 0
 
-
 @app.get("/")
 def run_enrichment():
     try:
         limit = int(request.args.get("limit", "5"))
-        dry = request.args.get("dry", "0") in ("1", "true", "True")
+        dry = request.args.get("dry", "0").lower() in ("1", "true", "t", "yes", "y")
     except Exception:
         return jsonify({"error": "invalid query params"}), 400
 
     rows = _select_rows(limit)
-    LOGGER.info("Selected %d row(s)", len(rows))
-
     preview = []
     updated = 0
+
     for r in rows:
         name, domain = r.get("name"), r.get("domain")
         upd = _derive_updates(r)
-        preview.append({
-            "name": name,
-            "domain": domain,
-            "derived": {k: v for k, v in upd.items() if k != "notes_append"}
-        })
+        preview.append({"name": name, "domain": domain, "derived": {k: v for k, v in upd.items() if k != "notes_append"}})
         if not dry:
             updated += _update_row(name, domain, upd)
 
@@ -152,11 +140,7 @@ def run_enrichment():
         out["preview"] = preview
     else:
         out["updated_rows"] = updated
-
     return jsonify(out)
 
-
-# Optional local run
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
-
