@@ -1,27 +1,30 @@
-# cloudbuild.yaml (commit to the root of HugoWinzer/Madrid_Data)
+# Cloud Build uses this to build & deploy automatically on push.
+substitutions:
+  _REGION: europe-southwest1
+  _SERVICE: madrid-enricher
+  _AR_REPO: rfp-docker-repo
+  _PROJECT: rfp-database-464609
+  _IMAGE: europe-southwest1-docker.pkg.dev/$_PROJECT/$_AR_REPO/$_SERVICE
+
 steps:
-  - name: gcr.io/cloud-builders/docker
-    args: ['build','-t','${_IMAGE}','.']
+- name: gcr.io/cloud-builders/docker
+  args: ["build","-t","$_IMAGE:$BUILD_ID","."]
+- name: gcr.io/cloud-builders/docker
+  args: ["push","$_IMAGE:$BUILD_ID"]
 
-  - name: gcr.io/cloud-builders/docker
-    args: ['push','${_IMAGE}']
-
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args:
-      [
-        'run','deploy','rfp-data-enricher-madrid',
-        '--image','${_IMAGE}',
-        '--region','us-central1',
-        '--allow-unauthenticated',
-        '--service-account','cr-madrid-runtime@rfp-database-464609.iam.gserviceaccount.com',
-        '--set-env-vars','BQ_LOCATION=europe-southwest1,BQ_TABLE=rfp-database-464609.rfpdata.performing_arts_madrid',
-        '--cpu','1','--memory','512Mi','--timeout','600',
-        '--min-instances','0','--max-instances','2'
-      ]
+# Deploy with the Database Project SA and Secret Manager key
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  args:
+    - run
+    - deploy
+    - $_SERVICE
+    - --image=$_IMAGE:$BUILD_ID
+    - --region=$_REGION
+    - --allow-unauthenticated
+    - --service-account=database-project@$_PROJECT.iam.gserviceaccount.com
+    - --timeout=600
+    - --set-env-vars=PROJECT_ID=$_PROJECT,BQ_DATASET=rfpdata,BQ_TABLE_NAME=performing_arts_madrid,BQ_LOCATION=$_REGION,OPENAI_MODEL=gpt-4o-mini
+    - --set-secrets=OPENAI_API_KEY=openai-api-key:latest
 
 images:
-  - us-central1-docker.pkg.dev/rfp-database-464609/cloud-run-source-deploy/rfp-data-enricher-madrid:$SHORT_SHA
-
-substitutions:
-  _IMAGE: us-central1-docker.pkg.dev/rfp-database-464609/cloud-run-source-deploy/rfp-data-enricher-madrid:$SHORT_SHA
+- $_IMAGE:$BUILD_ID
