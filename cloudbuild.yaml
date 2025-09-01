@@ -1,30 +1,28 @@
-# Cloud Build uses this to build & deploy automatically on push.
+# path: cloudbuild.yaml
 substitutions:
-  _REGION: europe-southwest1
   _SERVICE: madrid-enricher
-  _AR_REPO: rfp-docker-repo
-  _PROJECT: rfp-database-464609
-  _IMAGE: europe-southwest1-docker.pkg.dev/$_PROJECT/$_AR_REPO/$_SERVICE
+  _REGION: europe-southwest1
+  _IMAGE: gcr.io/$PROJECT_ID/${_SERVICE}
 
 steps:
-- name: gcr.io/cloud-builders/docker
-  args: ["build","-t","$_IMAGE:$BUILD_ID","."]
-- name: gcr.io/cloud-builders/docker
-  args: ["push","$_IMAGE:$BUILD_ID"]
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', '${_IMAGE}:$SHORT_SHA', '.']
 
-# Deploy with the Database Project SA and Secret Manager key
-- name: gcr.io/google.com/cloudsdktool/cloud-sdk
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', '${_IMAGE}:$SHORT_SHA']
+
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
   args:
-    - run
-    - deploy
-    - $_SERVICE
-    - --image=$_IMAGE:$BUILD_ID
-    - --region=$_REGION
-    - --allow-unauthenticated
-    - --service-account=database-project@$_PROJECT.iam.gserviceaccount.com
-    - --timeout=600
-    - --set-env-vars=PROJECT_ID=$_PROJECT,BQ_DATASET=rfpdata,BQ_TABLE_NAME=performing_arts_madrid,BQ_LOCATION=$_REGION,OPENAI_MODEL=gpt-4o-mini
-    - --set-secrets=OPENAI_API_KEY=openai-api-key:latest
+    [
+      'run','deploy','${_SERVICE}',
+      '--image','${_IMAGE}:$SHORT_SHA',
+      '--region','${_REGION}',
+      '--platform','managed',
+      '--allow-unauthenticated',
+      '--update-env-vars','BQ_TABLE=rfp-database-464609.rfpdata.performing_arts_madrid,BQ_LOCATION=europe-southwest1',
+      '--update-secrets','OPENAI_API_KEY=OPENAI_API_KEY:latest'
+    ]
 
 images:
-- $_IMAGE:$BUILD_ID
+- '${_IMAGE}:$SHORT_SHA'
