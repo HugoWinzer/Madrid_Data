@@ -37,24 +37,34 @@ TARGET_FIELDS: Tuple[str, ...] = STRING_FIELDS + NUMERIC_FIELDS
 KEY_FIELDS: Tuple[str, str, str] = ("site_event_entity", "city", "website")
 
 def _decimal_or_none(v: Any) -> Optional[Decimal]:
-    if v in (None, "", "null", "None"): return None
-    try: return Decimal(str(v).replace(",", ""))
-    except (InvalidOperation, ValueError, TypeError): return None
+    if v in (None, "", "null", "None"):
+        return None
+    try:
+        return Decimal(str(v).replace(",", ""))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
 def _strip_or_none(v: Any) -> Optional[str]:
-    if v is None: return None
+    if v is None:
+        return None
     s = str(v).strip()
     return s if s else None
 
 def _jsonify_value(v: Any) -> Any:
-    """Convert BQ values to JSON-safe (Decimal -> float)."""
+    # Why: BigQuery client returns Decimal for NUMERIC; JSON needs float/str.
     if isinstance(v, Decimal):
-        try: return float(v)
-        except Exception: return str(v)
+        try:
+            return float(v)
+        except Exception:
+            return str(v)
     return v
 
 def _jsonify_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: _jsonify_value(v) for k, v in d.items()}
+
+def _fallback_for(field: str) -> Any:
+    # Why: guarantee no NULLs remain even if the model skips fields.
+    return Decimal("0") if field in NUMERIC_FIELDS else ""
 
 @dataclass
 class RowKey:
@@ -88,17 +98,16 @@ def _fetch_batch(limit: int) -> List[Dict[str, Any]]:
     return [dict(row) for row in job]
 
 def _make_prompt(row: Dict[str, Any]) -> List[Dict[str, str]]:
-    # Ensure JSON-safe values for the prompt (Decimal -> float)
     known_raw = {k: row.get(k) for k in TARGET_FIELDS if row.get(k) not in (None, "")}
     known = _jsonify_dict(known_raw)
     unknown = [k for k in TARGET_FIELDS if row.get(k) in (None, "")]
     system = (
         "You are a careful data enricher for a Madrid performing arts dataset. "
-        "Return ONLY compact JSON. Preserve any provided values exactly. "
-        "For missing fields, estimate reasonable values; do NOT return 'unknown'. Prefer EUR."
+        "Return ONLY compact JSON with keys for ALL missing fields. "
+        "Preserve any provided values exactly. Prefer EUR for prices."
     )
     user = {
-        "task": "Fill missing fields so none are null.",
+        "task": "Fill all missing fields so none are null.",
         "entity": row.get("site_event_entity"),
         "city": row.get("city"),
         "website": row.get("website"),
@@ -110,7 +119,9 @@ def _make_prompt(row: Dict[str, Any]) -> List[Dict[str, str]]:
             {"role": "user", "content": json.dumps(user)}]
 
 def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
-    if _oai_client is None: raise RuntimeError("OPENAI_API_KEY missing")
+    if _oai_client is None:
+        raise RuntimeError("OPENAI_API_KEY missing")
+    unknown = [k for k in TARGET_FIELDS if row.get(k) in (None, "")]
     resp = _oai_client.chat.completions.create(
         model=OAI_MODEL, temperature=0.2,
         response_format={"type": "json_object"},
@@ -118,22 +129,34 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     )
     txt = resp.choices[0].message.content or "{}"
     data: Dict[str, Any] = json.loads(txt)
+
+    # Build patch from model
     patch: Dict[str, Any] = {}
     for k in STRING_FIELDS:
         val = _strip_or_none(data.get(k))
-        if val is not None: patch[k] = val
+        if val is not None:
+            patch[k] = val
     for k in NUMERIC_FIELDS:
         val = _decimal_or_none(data.get(k))
-        if val is not None: patch[k] = val
+        if val is not None:
+            patch[k] = val
+
+    # Fallbacks for anything the model missed (ensures no NULLs remain)
+    for k in unknown:
+        if k not in patch:
+            patch[k] = _fallback_for(k)
+
     return patch
 
 def _update_row(key: RowKey, patch: Dict[str, Any]) -> None:
-    if not patch: return
-    set_clauses = [f"{col} = COALESCE({col}, @{col})" for col in patch.keys()]
-    set_clauses += ["enrichment_status = 'enriched'", "last_updated = CURRENT_TIMESTAMP()"]
+    # Always set status/timestamp; COALESCE prevents overwriting non-null columns.
+    set_parts: List[str] = [f"{col} = COALESCE({col}, @{col})" for col in patch.keys()]
+    set_parts += ["enrichment_status = 'enriched'", "last_updated = CURRENT_TIMESTAMP()"]
+    set_sql = ", ".join(set_parts) if set_parts else "enrichment_status = 'enriched', last_updated = CURRENT_TIMESTAMP()"
+
     sql = f"""
     UPDATE `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TBL}`
-    SET {", ".join(set_clauses)}
+    SET {set_sql}
     WHERE site_event_entity = @k_entity
       AND IFNULL(city, '') = @k_city
       AND IFNULL(website, '') = @k_website
@@ -146,19 +169,24 @@ def _update_row(key: RowKey, patch: Dict[str, Any]) -> None:
     for col, val in patch.items():
         typ = "NUMERIC" if col in NUMERIC_FIELDS else "STRING"
         params.append(bigquery.ScalarQueryParameter(col, typ, val))
+
     _bq_client.query(sql, location=BQ_LOCATION,
                      job_config=bigquery.QueryJobConfig(query_parameters=params)
                     ).result()
 
 @app.get("/ping")
-def ping(): return jsonify({"ok": True})
+def ping():
+    return jsonify({"ok": True})
 
 @app.get("/ready")
 def ready():
     ok, errs = True, []
-    try: _ = _bq_client.query("SELECT 1").result()
-    except GoogleAPIError as e: ok, errs = False, [f"bq:{e.__class__.__name__}"]
-    if _oai_client is None: ok, errs = False, errs + ["openai:key_missing"]
+    try:
+        _ = _bq_client.query("SELECT 1").result()
+    except GoogleAPIError as e:
+        ok, errs = False, [f"bq:{e.__class__.__name__}"]
+    if _oai_client is None:
+        ok, errs = False, errs + ["openai:key_missing"]
     return (jsonify({"ok": ok, "errors": errs}), 200 if ok else 500)
 
 @app.post("/enrich")
@@ -171,10 +199,12 @@ def enrich():
         max_batches = int(request.args.get("max_batches","9999"))
     except Exception:
         return jsonify({"status":"error","error":"bad query params"}), 400
+
     updated, batches = 0, 0
     while batches < max_batches:
         rows = _fetch_batch(batch)
-        if not rows: break
+        if not rows:
+            break
         for r in rows:
             key = RowKey.from_row(r)
             try:
@@ -185,14 +215,19 @@ def enrich():
                 continue
             except Exception:
                 continue
-            if patch:
-                try: _update_row(key, patch); updated += 1
-                except GoogleAPIError: pass
+            try:
+                _update_row(key, patch)
+                updated += 1
+            except GoogleAPIError:
+                pass
             time.sleep(sleep)
         batches += 1
-    return jsonify({"status": "done" if batches < max_batches else "stopped_on_max_batches",
-                    "updated": updated, "batches": batches})
+
+    return jsonify({
+        "status": "done" if batches < max_batches else "stopped_on_max_batches",
+        "updated": updated,
+        "batches": batches,
+    })
 
 if __name__ == "__main__":
-    from gunicorn.app.base import Application  # not required on Cloud Run; for local dev only
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")), debug=False)
