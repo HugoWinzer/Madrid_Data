@@ -1,47 +1,39 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# Fixed to your environment
+# Config (change once, keep for all runs)
 PROJECT_ID="rfp-database-464609"
-REGION="us-central1"
-SERVICE="rfp-data-enricher-madrid"
-BQ_LOCATION="europe-southwest1"
-BQ_TABLE="rfp-database-464609.rfpdata.performing_arts_madrid"
+REGION="europe-southwest1"
+SERVICE="madrid-enricher"
+REPO="rfp-docker-repo"
 
-IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${SERVICE}:manual"
+# Artifact Registry setup
+gcloud artifacts repositories create "$REPO" \
+  --repository-format=docker \
+  --location="$REGION" \
+  --project="$PROJECT_ID" || true
 
-echo "Using: PROJECT_ID=$PROJECT_ID REGION=$REGION SERVICE=$SERVICE"
-gcloud config set project "$PROJECT_ID"
+# Image name with timestamp
+IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/${SERVICE}:$(date +%Y%m%d-%H%M%S)"
 
-# Ensure Artifact Registry exists and auth is configured
-gcloud artifacts repositories create cloud-run-source-deploy \
-  --repository-format=docker --location="$REGION" \
-  --description="Images for Madrid Enricher" 2>/dev/null || true
-gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+# Remote build (no local Docker needed)
+gcloud builds submit --tag "$IMAGE" .
 
-echo -e "\n==> Build & Push"
-docker build -t "$IMAGE" .
-docker push "$IMAGE"
-
-echo -e "\n==> Deploy to Cloud Run"
+# Deploy to Cloud Run
 gcloud run deploy "$SERVICE" \
   --image "$IMAGE" \
   --region "$REGION" \
+  --platform managed \
   --allow-unauthenticated \
-  --set-env-vars "BQ_LOCATION=$BQ_LOCATION,BQ_TABLE=$BQ_TABLE" \
-  --cpu 1 --memory 512Mi --timeout 600 \
-  --min-instances 0 --max-instances 2
+  --max-instances=2 \
+  --cpu=1 \
+  --memory=512Mi \
+  --set-env-vars BQ_LOCATION="$REGION" \
+  --set-env-vars BQ_TABLE="rfp-database-464609.rfpdata.performing_arts_madrid" \
+  --timeout=600
 
-SERVICE_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')
-echo "Service URL: $SERVICE_URL"
-
-echo -e "\n==> Health checks"
-curl -sS "$SERVICE_URL/ping"; echo
-curl -sS "$SERVICE_URL/ready"; echo
-
-echo -e "\n==> Dry-run preview"
-curl -sS "$SERVICE_URL/?limit=3&dry=1" | sed -e 's/.*/\n--- Preview (truncated) ---\n&\n---------------------------/'; echo
-
-# To write updates, run:
-# curl -sS "$SERVICE_URL/?limit=3" | jq
-
+# Quick health checks (optional, if endpoints exist)
+URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format 'value(status.url)')
+echo "Deployed at $URL"
+curl -fsS "$URL/ping" || true
+curl -fsS "$URL/ready" || true
