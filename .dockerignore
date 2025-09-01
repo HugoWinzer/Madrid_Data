@@ -1,9 +1,14 @@
+# path: .dockerignore
 .git
+.gitignore
+.gcloudignore
+cloudbuild.yaml
+scripts/
 __pycache__/
-*.py[cod]
-*.log
+*.pyc
+*.pyo
+*.pyd
+venv/
 .env
-.venv/
-.DS_Store
-node_modules
+.env.*
 tests/
