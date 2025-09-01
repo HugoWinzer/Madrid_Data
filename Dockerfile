@@ -1,18 +1,23 @@
+# path: Dockerfile
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
-ENV PYTHONPATH=/app PORT=8080
+COPY src ./src
 
-# non-root
-RUN useradd -m appuser && chown -R appuser:appuser /app
+RUN useradd -m appuser
 USER appuser
 
-CMD ["bash","-lc","gunicorn -w 1 -b 0.0.0.0:${PORT:-8080} --timeout 600 src.madrid_enricher:app"]
+ENV PORT=8080 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8080
+
+CMD exec gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT 'src.madrid_enricher:app'
