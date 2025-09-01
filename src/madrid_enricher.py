@@ -25,6 +25,7 @@ if BQ_TABLE.count(".") != 2:
 
 BQ_PROJECT, BQ_DATASET, BQ_TBL = BQ_TABLE.split(".")
 
+# ---- schema ----
 STRING_FIELDS: Tuple[str, ...] = (
     "site_event_entity","city","category","sub_category","website",
     "event_size_segment","private_public","rfp","enrichment_status","comments",
@@ -36,6 +37,7 @@ TIMESTAMP_FIELDS: Tuple[str, ...] = ("last_updated",)
 TARGET_FIELDS: Tuple[str, ...] = STRING_FIELDS + NUMERIC_FIELDS
 KEY_FIELDS: Tuple[str, str, str] = ("site_event_entity", "city", "website")
 
+# ---- utils ----
 def _decimal_or_none(v: Any) -> Optional[Decimal]:
     if v in (None, "", "null", "None"):
         return None
@@ -51,10 +53,9 @@ def _strip_or_none(v: Any) -> Optional[str]:
     return s if s else None
 
 def _jsonify_value(v: Any) -> Any:
-    # Why: BigQuery client returns Decimal for NUMERIC; JSON needs float/str.
     if isinstance(v, Decimal):
         try:
-            return float(v)
+            return float(v)  # keep prompt JSON-safe
         except Exception:
             return str(v)
     return v
@@ -63,7 +64,7 @@ def _jsonify_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: _jsonify_value(v) for k, v in d.items()}
 
 def _fallback_for(field: str) -> Any:
-    # Why: guarantee no NULLs remain even if the model skips fields.
+    # Ensures we never leave NULLs behind if model omits a key
     return Decimal("0") if field in NUMERIC_FIELDS else ""
 
 @dataclass
@@ -73,10 +74,12 @@ class RowKey:
     def from_row(cls, row: Dict[str, Any]) -> "RowKey":
         return cls(row.get("site_event_entity") or "", row.get("city") or "", row.get("website") or "")
 
+# ---- clients ----
 app = Flask(__name__)
 _bq_client = bigquery.Client(project=PROJECT_ID)
 _oai_client: Optional[OpenAI] = OpenAI() if os.getenv("OPENAI_API_KEY") else None
 
+# ---- bq helpers ----
 def _null_predicate(cols: Iterable[str]) -> str:
     return " OR ".join([f"{col} IS NULL" for col in cols])
 
@@ -104,7 +107,7 @@ def _make_prompt(row: Dict[str, Any]) -> List[Dict[str, str]]:
     system = (
         "You are a careful data enricher for a Madrid performing arts dataset. "
         "Return ONLY compact JSON with keys for ALL missing fields. "
-        "Preserve any provided values exactly. Prefer EUR for prices."
+        "Preserve provided values exactly. Prefer EUR for prices."
     )
     user = {
         "task": "Fill all missing fields so none are null.",
@@ -130,7 +133,6 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     txt = resp.choices[0].message.content or "{}"
     data: Dict[str, Any] = json.loads(txt)
 
-    # Build patch from model
     patch: Dict[str, Any] = {}
     for k in STRING_FIELDS:
         val = _strip_or_none(data.get(k))
@@ -141,7 +143,7 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
         if val is not None:
             patch[k] = val
 
-    # Fallbacks for anything the model missed (ensures no NULLs remain)
+    # Backfill any keys the model skipped
     for k in unknown:
         if k not in patch:
             patch[k] = _fallback_for(k)
@@ -149,15 +151,16 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     return patch
 
 def _update_row(key: RowKey, patch: Dict[str, Any]) -> None:
-    # Always set status/timestamp; COALESCE prevents overwriting non-null columns.
+    # Build update: never overwrite non-null values
     set_parts: List[str] = [f"{col} = COALESCE({col}, @{col})" for col in patch.keys()]
     set_parts += ["enrichment_status = 'enriched'", "last_updated = CURRENT_TIMESTAMP()"]
     set_sql = ", ".join(set_parts) if set_parts else "enrichment_status = 'enriched', last_updated = CURRENT_TIMESTAMP()"
 
+    # IMPORTANT: handle NULL keys with IFNULL on ALL key columns
     sql = f"""
     UPDATE `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TBL}`
     SET {set_sql}
-    WHERE site_event_entity = @k_entity
+    WHERE IFNULL(site_event_entity, '') = @k_entity
       AND IFNULL(city, '') = @k_city
       AND IFNULL(website, '') = @k_website
     """
@@ -170,10 +173,12 @@ def _update_row(key: RowKey, patch: Dict[str, Any]) -> None:
         typ = "NUMERIC" if col in NUMERIC_FIELDS else "STRING"
         params.append(bigquery.ScalarQueryParameter(col, typ, val))
 
-    _bq_client.query(sql, location=BQ_LOCATION,
-                     job_config=bigquery.QueryJobConfig(query_parameters=params)
-                    ).result()
+    _bq_client.query(
+        sql, location=BQ_LOCATION,
+        job_config=bigquery.QueryJobConfig(query_parameters=params)
+    ).result()
 
+# ---- routes ----
 @app.get("/ping")
 def ping():
     return jsonify({"ok": True})
@@ -189,17 +194,7 @@ def ready():
         ok, errs = False, errs + ["openai:key_missing"]
     return (jsonify({"ok": ok, "errors": errs}), 200 if ok else 500)
 
-@app.post("/enrich")
-def enrich():
-    if _oai_client is None:
-        return jsonify({"status":"error","error":"OPENAI_API_KEY missing"}), 500
-    try:
-        batch = int(request.args.get("batch","25"))
-        sleep = float(request.args.get("sleep","0.15"))
-        max_batches = int(request.args.get("max_batches","9999"))
-    except Exception:
-        return jsonify({"status":"error","error":"bad query params"}), 400
-
+def _run_enrichment(batch: int, sleep: float, max_batches: int) -> Dict[str, Any]:
     updated, batches = 0, 0
     while batches < max_batches:
         rows = _fetch_batch(batch)
@@ -210,7 +205,7 @@ def enrich():
             try:
                 patch = _enrich_one(r)
             except RateLimitError:
-                return jsonify({"status":"stopped_on_rate_limit","updated":updated,"batch":batches})
+                return {"status":"stopped_on_rate_limit","updated":updated,"batches":batches}
             except APIStatusError:
                 continue
             except Exception:
@@ -222,12 +217,30 @@ def enrich():
                 pass
             time.sleep(sleep)
         batches += 1
-
-    return jsonify({
+    return {
         "status": "done" if batches < max_batches else "stopped_on_max_batches",
         "updated": updated,
         "batches": batches,
-    })
+    }
+
+@app.post("/enrich")
+def enrich():
+    if _oai_client is None:
+        return jsonify({"status":"error","error":"OPENAI_API_KEY missing"}), 500
+    try:
+        batch = int(request.args.get("batch","25"))
+        sleep = float(request.args.get("sleep","0.15"))
+        max_batches = int(request.args.get("max_batches","9999"))
+    except Exception:
+        return jsonify({"status":"error","error":"bad query params"}), 400
+    return jsonify(_run_enrichment(batch, sleep, max_batches))
+
+# Preset for ~200 rows: 10x20 with gentle pacing
+@app.post("/enrich_200")
+def enrich_200():
+    if _oai_client is None:
+        return jsonify({"status":"error","error":"OPENAI_API_KEY missing"}), 500
+    return jsonify(_run_enrichment(batch=10, sleep=0.2, max_batches=20))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")), debug=False)
