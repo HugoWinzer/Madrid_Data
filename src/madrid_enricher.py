@@ -19,13 +19,13 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 BQ_TABLE = os.getenv("BQ_TABLE", "rfp-database-464609.rfpdata.performing_arts_madrid")
 BQ_LOCATION = os.getenv("BQ_LOCATION", "europe-southwest1")
 OAI_MODEL = os.getenv("OAI_MODEL", "gpt-4o-mini")
+LOG_PROGRESS = os.getenv("LOG_PROGRESS", "0") == "1"  # print per-row summary to logs
 
 if BQ_TABLE.count(".") != 2:
     raise RuntimeError("BQ_TABLE must be fully-qualified: <project>.<dataset>.<table>")
 
 BQ_PROJECT, BQ_DATASET, BQ_TBL = BQ_TABLE.split(".")
 
-# ---- schema ----
 STRING_FIELDS: Tuple[str, ...] = (
     "site_event_entity","city","category","sub_category","website",
     "event_size_segment","private_public","rfp","enrichment_status","comments",
@@ -37,34 +37,26 @@ TIMESTAMP_FIELDS: Tuple[str, ...] = ("last_updated",)
 TARGET_FIELDS: Tuple[str, ...] = STRING_FIELDS + NUMERIC_FIELDS
 KEY_FIELDS: Tuple[str, str, str] = ("site_event_entity", "city", "website")
 
-# ---- utils ----
 def _decimal_or_none(v: Any) -> Optional[Decimal]:
-    if v in (None, "", "null", "None"):
-        return None
-    try:
-        return Decimal(str(v).replace(",", ""))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+    if v in (None, "", "null", "None"): return None
+    try: return Decimal(str(v).replace(",", ""))
+    except (InvalidOperation, ValueError, TypeError): return None
 
 def _strip_or_none(v: Any) -> Optional[str]:
-    if v is None:
-        return None
+    if v is None: return None
     s = str(v).strip()
     return s if s else None
 
 def _jsonify_value(v: Any) -> Any:
     if isinstance(v, Decimal):
-        try:
-            return float(v)  # keep prompt JSON-safe
-        except Exception:
-            return str(v)
+        try: return float(v)
+        except Exception: return str(v)
     return v
 
 def _jsonify_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: _jsonify_value(v) for k, v in d.items()}
 
 def _fallback_for(field: str) -> Any:
-    # Ensures we never leave NULLs behind if model omits a key
     return Decimal("0") if field in NUMERIC_FIELDS else ""
 
 @dataclass
@@ -74,12 +66,10 @@ class RowKey:
     def from_row(cls, row: Dict[str, Any]) -> "RowKey":
         return cls(row.get("site_event_entity") or "", row.get("city") or "", row.get("website") or "")
 
-# ---- clients ----
 app = Flask(__name__)
 _bq_client = bigquery.Client(project=PROJECT_ID)
 _oai_client: Optional[OpenAI] = OpenAI() if os.getenv("OPENAI_API_KEY") else None
 
-# ---- bq helpers ----
 def _null_predicate(cols: Iterable[str]) -> str:
     return " OR ".join([f"{col} IS NULL" for col in cols])
 
@@ -143,20 +133,18 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
         if val is not None:
             patch[k] = val
 
-    # Backfill any keys the model skipped
     for k in unknown:
         if k not in patch:
             patch[k] = _fallback_for(k)
 
     return patch
 
-def _update_row(key: RowKey, patch: Dict[str, Any]) -> None:
-    # Build update: never overwrite non-null values
+def _update_row(key: RowKey, patch: Dict[str, Any]) -> int:
+    # COALESCE prevents overwriting existing non-null values
     set_parts: List[str] = [f"{col} = COALESCE({col}, @{col})" for col in patch.keys()]
     set_parts += ["enrichment_status = 'enriched'", "last_updated = CURRENT_TIMESTAMP()"]
     set_sql = ", ".join(set_parts) if set_parts else "enrichment_status = 'enriched', last_updated = CURRENT_TIMESTAMP()"
 
-    # IMPORTANT: handle NULL keys with IFNULL on ALL key columns
     sql = f"""
     UPDATE `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TBL}`
     SET {set_sql}
@@ -173,12 +161,13 @@ def _update_row(key: RowKey, patch: Dict[str, Any]) -> None:
         typ = "NUMERIC" if col in NUMERIC_FIELDS else "STRING"
         params.append(bigquery.ScalarQueryParameter(col, typ, val))
 
-    _bq_client.query(
+    job = _bq_client.query(
         sql, location=BQ_LOCATION,
         job_config=bigquery.QueryJobConfig(query_parameters=params)
-    ).result()
+    )
+    job.result()
+    return int(job.num_dml_affected_rows or 0)
 
-# ---- routes ----
 @app.get("/ping")
 def ping():
     return jsonify({"ok": True})
@@ -195,7 +184,7 @@ def ready():
     return (jsonify({"ok": ok, "errors": errs}), 200 if ok else 500)
 
 def _run_enrichment(batch: int, sleep: float, max_batches: int) -> Dict[str, Any]:
-    updated, batches = 0, 0
+    updated, attempted, batches = 0, 0, 0
     while batches < max_batches:
         rows = _fetch_batch(batch)
         if not rows:
@@ -205,23 +194,25 @@ def _run_enrichment(batch: int, sleep: float, max_batches: int) -> Dict[str, Any
             try:
                 patch = _enrich_one(r)
             except RateLimitError:
-                return {"status":"stopped_on_rate_limit","updated":updated,"batches":batches}
+                return {"status":"stopped_on_rate_limit","updated":updated,"attempted":attempted,"batches":batches}
             except APIStatusError:
+                if LOG_PROGRESS: print(f"[skip:api] {key}")
                 continue
             except Exception:
+                if LOG_PROGRESS: print(f"[skip:err] {key}")
                 continue
             try:
-                _update_row(key, patch)
-                updated += 1
+                affected = _update_row(key, patch)
+                updated += affected
+                attempted += 1
+                if LOG_PROGRESS: print(f"[row] {key} affected={affected}")
             except GoogleAPIError:
+                if LOG_PROGRESS: print(f"[skip:bq] {key}")
                 pass
             time.sleep(sleep)
         batches += 1
-    return {
-        "status": "done" if batches < max_batches else "stopped_on_max_batches",
-        "updated": updated,
-        "batches": batches,
-    }
+    return {"status": "done" if batches < max_batches else "stopped_on_max_batches",
+            "updated": updated, "attempted": attempted, "batch_size": batch, "batches": batches}
 
 @app.post("/enrich")
 def enrich():
@@ -235,12 +226,12 @@ def enrich():
         return jsonify({"status":"error","error":"bad query params"}), 400
     return jsonify(_run_enrichment(batch, sleep, max_batches))
 
-# Preset for ~200 rows: 10x20 with gentle pacing
-@app.post("/enrich_200")
-def enrich_200():
+# EXACTLY 10 rows (10 x 1)
+@app.post("/enrich_10")
+def enrich_10():
     if _oai_client is None:
         return jsonify({"status":"error","error":"OPENAI_API_KEY missing"}), 500
-    return jsonify(_run_enrichment(batch=10, sleep=0.2, max_batches=20))
+    return jsonify(_run_enrichment(batch=10, sleep=0.25, max_batches=1))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")), debug=False)
